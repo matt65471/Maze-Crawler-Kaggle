@@ -26,6 +26,16 @@ from kaggle_environments import make
 
 import main
 
+# Frozen previous version, used for head-to-head measurement. `random` is
+# saturated (we win 100%) and the self-mirror is symmetric (~50% by
+# construction), so neither can detect small gains; playing the live bot against
+# a frozen snapshot gives a real, asymmetric win-rate signal.
+try:
+    import agent_baseline
+    _BASELINE = agent_baseline.agent
+except Exception:
+    _BASELINE = None
+
 
 def _factory_of(global_robots, side):
     for d in global_robots.values():
@@ -121,6 +131,10 @@ def main_eval(seed_count=12):
         "random": "random",
         "self": main.agent,
     }
+    if _BASELINE is not None:
+        # The head-to-head that actually measures progress: live bot vs frozen
+        # snapshot. >50% here means the current changes genuinely beat the old bot.
+        opponents["baseline"] = _BASELINE
     print(f"Evaluating main.agent over {len(seeds)} seeds x 2 sides "
           f"= {2 * len(seeds)} games per opponent.\n")
     header = f"{'opponent':<10} {'games':>6} {'W/T/L':>10} {'winrate':>8} {'survival':>9} {'avgRow':>7} {'avgEnergy':>10}"

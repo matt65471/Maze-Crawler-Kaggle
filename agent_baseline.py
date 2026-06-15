@@ -52,12 +52,9 @@ FRONTIER_COL_WEIGHT = 1        # penalty per column away from the factory
 # ground is how it gets caught by the scroll. Allow only a small dip below its
 # current row to sidestep a wall.
 FACTORY_BACKTRACK_LIMIT = 2
-# Jump/survival lookahead: rather than a fixed margin trigger, project whether
-# walking can out-run the scroll. We jump only when the projection says we'd
-# lose the race within the jump's own cooldown window (or we're truly boxed),
-# so the 20-turn jump is saved for when it actually matters.
-WALK_EFFICIENCY = 0.75        # fraction of nominal walk speed realized (mazes force detours)
-FACTORY_CRITICAL_MARGIN = 1   # at/below this buffer above the boundary, jump now if able
+# When the factory's buffer above the boundary shrinks to this, jump north
+# proactively (if ready) to bank distance, even if it isn't fully boxed in.
+FACTORY_JUMP_MARGIN = 3
 
 # Crush table from the environment (see crawl.py): an (attacker, victim) pair
 # means the attacker wins. Strength order Factory > Miner > Worker > Scout, and
@@ -110,42 +107,6 @@ def _south(obs):
 
 def _north(obs, config):
     return int(_get(obs, "northBound", _south(obs) + _height(config) - 1))
-
-
-def _scroll_interval(step, config):
-    """Turns between scroll advances at `step` (mirrors the environment's
-    get_scroll_interval). The period is deterministic from the step; only the
-    phase/counter is hidden, so we use this as the scroll *rate*."""
-    ramp = int(_get(config, "scrollRampSteps", 450))
-    start = int(_get(config, "scrollStartInterval", 10))
-    end = int(_get(config, "scrollEndInterval", 2))
-    if step >= ramp:
-        return end
-    progress = step / max(1, ramp)
-    interval = start - (start - end) * progress
-    return max(end, round(interval))
-
-
-def _factory_should_jump(obs, config, factory, has_north_target, boxed):
-    """Lookahead jump decision: project the survival margin over the jump's
-    cooldown window and only jump when walking can't keep us ahead of the scroll
-    (or we're boxed in). Returns True to jump now."""
-    if boxed:
-        return True  # can't progress on foot — jump to break out
-    margin = factory["row"] - _south(obs)
-    if margin <= FACTORY_CRITICAL_MARGIN:
-        return True  # about to be overrun; jump regardless
-    step = int(_get(obs, "step", 0))
-    scroll_rate = 1.0 / max(1, _scroll_interval(step, config))
-    move_period = int(_get(config, "factoryMovePeriod", 2))
-    walk_rate = WALK_EFFICIENCY / max(1, move_period)
-    net = walk_rate - scroll_rate
-    if net >= 0:
-        return False  # we out-run the scroll on foot — save the jump
-    # Margin shrinks: will we reach the danger floor within the jump's cooldown?
-    horizon = int(_get(config, "factoryJumpCooldown", 20))
-    turns_to_danger = (margin - FACTORY_CRITICAL_MARGIN) / (-net)
-    return turns_to_danger <= horizon
 
 
 # --- Basic geometry / wall helpers -----------------------------------------
@@ -559,7 +520,7 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
     """Prime directive: get the factory as far north as possible.
 
     Order of operations so north progress is never sacrificed for building:
-      0. Lookahead jump: jump only if walking can't out-run the scroll (or boxed).
+      0. If our buffer above the boundary is small, JUMP_NORTH proactively.
       1. If we can move this turn and a cell north of us is reachable, move there.
       2. Otherwise (move on cooldown, or boxed) build, reserve-gated.
       3. If genuinely boxed in, JUMP_NORTH when ready/safe, else IDLE.
@@ -567,6 +528,7 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
     danger = danger or set()
     south = _south(obs)
     start = (factory["col"], factory["row"])
+    margin = factory["row"] - south
     # Bound how far south the factory may dip: only a small detour below its
     # current row (never march back toward the scroll), and always stay clear of
     # the boundary. This is what stops the factory backtracking into death.
@@ -583,21 +545,20 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
         _commit(occupied, start, (lc, lr))
         return "JUMP_NORTH"
 
+    # 0) Proactive jump when the scroll is closing in (jump gains 2 cells and
+    # ignores walls, so it's the best way to recover a shrinking margin).
+    if margin <= FACTORY_JUMP_MARGIN and _can_jump_now(factory):
+        j = _try_jump()
+        if j:
+            return j
+
     # Optimistic BFS (fog treated as open) over reachable cells, avoiding danger.
-    # Run it first so the jump decision knows whether we can walk north at all.
     reserved = set(occupied)
     reserved.discard(start)
     reserved |= danger
     dist, _parent = _bfs_all(obs, config, start, reserved, min_row)
     north_target = choose_factory_target(obs, config, factory, dist)
     boxed = north_target is None  # no cell north of us is reachable -> walled in
-
-    # 0) Lookahead jump: project whether walking out-runs the scroll; jump only
-    # when it doesn't (or we're boxed), so the 20-turn jump is saved for need.
-    if _can_jump_now(factory) and _factory_should_jump(obs, config, factory, not boxed, boxed):
-        j = _try_jump()
-        if j:
-            return j
 
     # 1) Advance north whenever possible.
     if _can_move_now(factory) and north_target is not None:
