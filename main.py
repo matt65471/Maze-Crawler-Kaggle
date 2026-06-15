@@ -48,6 +48,31 @@ CRYSTAL_DETOUR = 4
 FRONTIER_AHEAD_WEIGHT = 2      # per row north of the factory
 FRONTIER_COL_WEIGHT = 1        # penalty per column away from the factory
 
+# The factory must not backtrack far south chasing a winding path — losing
+# ground is how it gets caught by the scroll. Allow only a small dip below its
+# current row to sidestep a wall.
+FACTORY_BACKTRACK_LIMIT = 2
+# When the factory's buffer above the boundary shrinks to this, jump north
+# proactively (if ready) to bank distance, even if it isn't fully boxed in.
+FACTORY_JUMP_MARGIN = 3
+
+# Crush table from the environment (see crawl.py): an (attacker, victim) pair
+# means the attacker wins. Strength order Factory > Miner > Worker > Scout, and
+# two units of the SAME type destroy each other (mutual) regardless of owner.
+_CRUSHES = {
+    (FACTORY, MINER), (FACTORY, WORKER), (FACTORY, SCOUT),
+    (MINER, WORKER), (MINER, SCOUT),
+    (WORKER, SCOUT),
+}
+
+
+def _loses_to(my_type, enemy_type):
+    """True if a head-on collision would destroy my unit: the enemy crushes me,
+    or we are the same type (mutual destruction — including factory vs factory)."""
+    if (enemy_type, my_type) in _CRUSHES:
+        return True
+    return enemy_type == my_type
+
 
 # --- Defensive accessors ---------------------------------------------------
 # Kaggle observations/configs may be dict-like or attribute objects. Read both.
@@ -199,6 +224,32 @@ def parse_robots(obs):
 def _parse_cell(key):
     c, r = key.split(",")
     return int(c), int(r)
+
+
+def _enemy_threat_map(obs, config, me):
+    """Map our-unit-type -> set of cells an enemy could occupy next turn that
+    would destroy a unit of that type.
+
+    Defensive combat awareness: enemies are only visible within our vision, so
+    this is local and reactive. We assume (conservatively) that each visible
+    enemy may stay put or step into any wall-open neighbor next turn."""
+    danger = {FACTORY: set(), SCOUT: set(), WORKER: set(), MINER: set()}
+    robots = parse_robots(obs)
+    for e in robots.values():
+        if e["owner"] == me:
+            continue
+        et = e["type"]
+        cells = [(e["col"], e["row"])]
+        for d in DIRS:
+            if has_wall(obs, config, e["col"], e["row"], d):
+                continue
+            nc, nr = apply_move(e["col"], e["row"], d)
+            if in_bounds(obs, config, nc, nr):
+                cells.append((nc, nr))
+        for my_type in (FACTORY, SCOUT, WORKER, MINER):
+            if _loses_to(my_type, et):
+                danger[my_type].update(cells)
+    return danger
 
 
 # Cooldowns in the observation are the post-action values; the interpreter
@@ -426,13 +477,16 @@ def choose_mining_node_target(obs, config, start, dist):
 
 # --- Reservation-aware movement helper -------------------------------------
 
-def _move_action(obs, config, robot, goals, occupied, min_row=None):
-    """Plan a BFS move toward `goals`. Returns (action, new_cell) or (None, None)."""
+def _move_action(obs, config, robot, goals, occupied, min_row=None, extra_blocked=None):
+    """Plan a BFS move toward `goals`. Returns (action, new_cell) or (None, None).
+    `extra_blocked` (e.g. enemy danger cells) is avoided in addition to friendlies."""
     if not _can_move_now(robot):
         return None, None
     start = (robot["col"], robot["row"])
     reserved = set(occupied)
     reserved.discard(start)
+    if extra_blocked:
+        reserved |= extra_blocked
     path = bfs_path(obs, config, start, goals, reserved, occupied, min_row)
     if not path:
         return None, None
@@ -462,30 +516,53 @@ def safe_fallback_move(obs, config, robot, reserved, friendly_positions, min_row
 
 # --- Per-type policies ------------------------------------------------------
 
-def _factory_action(obs, config, factory, mine_robots, occupied):
+def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
     """Prime directive: get the factory as far north as possible.
 
     Order of operations so north progress is never sacrificed for building:
+      0. If our buffer above the boundary is small, JUMP_NORTH proactively.
       1. If we can move this turn and a cell north of us is reachable, move there.
       2. Otherwise (move on cooldown, or boxed) build, reserve-gated.
       3. If genuinely boxed in, JUMP_NORTH when ready/safe, else IDLE.
     """
+    danger = danger or set()
     south = _south(obs)
     start = (factory["col"], factory["row"])
-    # Keep a safety buffer above the boundary so the scroll can never catch the
-    # factory, while still allowing lateral / small detours around walls.
-    min_row = min(factory["row"], south + 2)
+    margin = factory["row"] - south
+    # Bound how far south the factory may dip: only a small detour below its
+    # current row (never march back toward the scroll), and always stay clear of
+    # the boundary. This is what stops the factory backtracking into death.
+    min_row = max(south + 2, factory["row"] - FACTORY_BACKTRACK_LIMIT)
 
-    # Optimistic BFS (fog treated as open) over reachable cells.
+    def _try_jump():
+        lc, lr = factory["col"], factory["row"] + 2
+        if not in_bounds(obs, config, lc, lr):
+            return None
+        if (lc, lr) in occupied or (lc, lr) in danger:
+            return None
+        if (lr - south) < 1:
+            return None
+        _commit(occupied, start, (lc, lr))
+        return "JUMP_NORTH"
+
+    # 0) Proactive jump when the scroll is closing in (jump gains 2 cells and
+    # ignores walls, so it's the best way to recover a shrinking margin).
+    if margin <= FACTORY_JUMP_MARGIN and _can_jump_now(factory):
+        j = _try_jump()
+        if j:
+            return j
+
+    # Optimistic BFS (fog treated as open) over reachable cells, avoiding danger.
     reserved = set(occupied)
     reserved.discard(start)
+    reserved |= danger
     dist, _parent = _bfs_all(obs, config, start, reserved, min_row)
     north_target = choose_factory_target(obs, config, factory, dist)
     boxed = north_target is None  # no cell north of us is reachable -> walled in
 
     # 1) Advance north whenever possible.
     if _can_move_now(factory) and north_target is not None:
-        action, new_cell = _move_action(obs, config, factory, {north_target}, occupied, min_row)
+        action, new_cell = _move_action(obs, config, factory, {north_target}, occupied, min_row, danger)
         if action:
             _commit(occupied, start, new_cell)
             return action
@@ -518,11 +595,9 @@ def _factory_action(obs, config, factory, mine_robots, occupied):
 
     # 3) Boxed in: jump two cells north (ignores walls) if it lands safely.
     if boxed and _can_jump_now(factory):
-        lc, lr = factory["col"], factory["row"] + 2
-        if in_bounds(obs, config, lc, lr) and (lc, lr) not in occupied:
-            if (lr - south) >= 1:
-                _commit(occupied, start, (lc, lr))
-                return "JUMP_NORTH"
+        j = _try_jump()
+        if j:
+            return j
     return "IDLE"
 
 
@@ -540,7 +615,8 @@ def _build_direction(obs, config, factory, occupied):
     return None
 
 
-def _scout_action(obs, config, scout, occupied, factory):
+def _scout_action(obs, config, scout, occupied, factory, danger=None):
+    danger = danger or set()
     refuel = _refuel_factory_action(obs, config, scout, factory)
     if refuel:
         return refuel
@@ -548,6 +624,7 @@ def _scout_action(obs, config, scout, occupied, factory):
     min_row = _south(obs) + 1  # never step onto the lethal boundary row
     reserved = set(occupied)
     reserved.discard(start)
+    reserved |= danger
     dist, _parent = _bfs_all(obs, config, start, reserved, min_row)
     vision = int(_get(config, "visionScout", 5))
 
@@ -560,7 +637,7 @@ def _scout_action(obs, config, scout, occupied, factory):
         target = choose_frontier_target(obs, config, start, vision, dist, factory)
 
     if target is not None:
-        action, new_cell = _move_action(obs, config, scout, {target}, occupied, min_row)
+        action, new_cell = _move_action(obs, config, scout, {target}, occupied, min_row, danger)
         if action:
             _commit(occupied, start, new_cell)
             return action
@@ -572,8 +649,9 @@ def _scout_action(obs, config, scout, occupied, factory):
     return "IDLE"
 
 
-def _worker_action(obs, config, worker, factory, occupied):
+def _worker_action(obs, config, worker, factory, occupied, danger=None):
     """Shadow the factory; clear a removable wall that pens it in to the north."""
+    danger = danger or set()
     refuel = _refuel_factory_action(obs, config, worker, factory)
     if refuel:
         return refuel
@@ -599,13 +677,14 @@ def _worker_action(obs, config, worker, factory, occupied):
     if factory is not None:
         goals = {(factory["col"], factory["row"] + 1)}
     if goals:
-        action, new_cell = _move_action(obs, config, worker, goals, occupied, min_row)
+        action, new_cell = _move_action(obs, config, worker, goals, occupied, min_row, danger)
         if action:
             _commit(occupied, start, new_cell)
             return action
 
     reserved = set(occupied)
     reserved.discard(start)
+    reserved |= danger
     d, new_cell = safe_fallback_move(obs, config, worker, reserved, occupied, min_row)
     if d:
         _commit(occupied, start, new_cell)
@@ -613,7 +692,8 @@ def _worker_action(obs, config, worker, factory, occupied):
     return "IDLE"
 
 
-def _miner_action(obs, config, miner, factory, occupied):
+def _miner_action(obs, config, miner, factory, occupied, danger=None):
+    danger = danger or set()
     refuel = _refuel_factory_action(obs, config, miner, factory)
     if refuel:
         return refuel
@@ -631,6 +711,7 @@ def _miner_action(obs, config, miner, factory, occupied):
 
     reserved = set(occupied)
     reserved.discard(start)
+    reserved |= danger
     dist, _parent = _bfs_all(obs, config, start, reserved, min_row)
 
     target = choose_mining_node_target(obs, config, start, dist)
@@ -644,7 +725,7 @@ def _miner_action(obs, config, miner, factory, occupied):
         target = choose_frontier_target(obs, config, start, int(_get(config, "visionMiner", 3)), dist)
 
     if target is not None:
-        action, new_cell = _move_action(obs, config, miner, {target}, occupied, min_row)
+        action, new_cell = _move_action(obs, config, miner, {target}, occupied, min_row, danger)
         if action:
             _commit(occupied, start, new_cell)
             return action
@@ -713,6 +794,10 @@ def _agent_impl(obs, config):
 
     factory = next((r for r in mine.values() if r["type"] == FACTORY), None)
 
+    # Defensive combat awareness: cells a visible enemy could reach next turn
+    # that would destroy each of our unit types.
+    threat = _enemy_threat_map(obs, config, me)
+
     # Process order minimizes collisions: Factory, Workers, Miners, Scouts.
     order = (
         [r for r in mine.values() if r["type"] == FACTORY]
@@ -725,13 +810,13 @@ def _agent_impl(obs, config):
         uid = robot["uid"]
         rtype = robot["type"]
         if rtype == FACTORY:
-            actions[uid] = _factory_action(obs, config, robot, mine, occupied)
+            actions[uid] = _factory_action(obs, config, robot, mine, occupied, threat[FACTORY])
         elif rtype == WORKER:
-            actions[uid] = _worker_action(obs, config, robot, factory, occupied)
+            actions[uid] = _worker_action(obs, config, robot, factory, occupied, threat[WORKER])
         elif rtype == MINER:
-            actions[uid] = _miner_action(obs, config, robot, factory, occupied)
+            actions[uid] = _miner_action(obs, config, robot, factory, occupied, threat[MINER])
         elif rtype == SCOUT:
-            actions[uid] = _scout_action(obs, config, robot, occupied, factory)
+            actions[uid] = _scout_action(obs, config, robot, occupied, factory, threat[SCOUT])
         else:
             actions[uid] = "IDLE"
 
