@@ -58,6 +58,18 @@ FACTORY_BACKTRACK_LIMIT = 2
 # so the 20-turn jump is saved for when it actually matters.
 WALK_EFFICIENCY = 0.75        # fraction of nominal walk speed realized (mazes force detours)
 FACTORY_CRITICAL_MARGIN = 1   # at/below this buffer above the boundary, jump now if able
+FACTORY_GOAL_SWITCH_MARGIN = 8
+FACTORY_CORRIDOR_DEPTH = 3
+FACTORY_ROUTE_LOOKAHEAD = 6
+FACTORY_LOW_MARGIN = 4
+FACTORY_JUMP_ROUTE_MARGIN = 5
+FACTORY_REFUEL_LOOKAHEAD = 6
+
+# Per-side memory persists across turns in the Kaggle worker. The factory uses
+# it to avoid thrashing between newly discovered routes unless the new route is
+# materially faster than the route it is already walking.
+_FACTORY_GOALS = {}
+_FACTORY_CORRIDORS = {}
 
 # Crush table from the environment (see crawl.py): an (attacker, victim) pair
 # means the attacker wins. Strength order Factory > Miner > Worker > Scout, and
@@ -126,7 +138,8 @@ def _scroll_interval(step, config):
     return max(end, round(interval))
 
 
-def _factory_should_jump(obs, config, factory, has_north_target, boxed):
+def _factory_should_jump(obs, config, factory, has_north_target, boxed,
+                         distance_to_progress=None):
     """Lookahead jump decision: project the survival margin over the jump's
     cooldown window and only jump when walking can't keep us ahead of the scroll
     (or we're boxed in). Returns True to jump now."""
@@ -135,6 +148,12 @@ def _factory_should_jump(obs, config, factory, has_north_target, boxed):
     margin = factory["row"] - _south(obs)
     if margin <= FACTORY_CRITICAL_MARGIN:
         return True  # about to be overrun; jump regardless
+    if distance_to_progress is not None:
+        projected = project_factory_margin(obs, config, factory, distance_to_progress)
+        if margin <= FACTORY_JUMP_ROUTE_MARGIN and projected <= FACTORY_CRITICAL_MARGIN:
+            return True
+    if has_north_target and margin > FACTORY_JUMP_ROUTE_MARGIN:
+        return False
     step = int(_get(obs, "step", 0))
     scroll_rate = 1.0 / max(1, _scroll_interval(step, config))
     move_period = int(_get(config, "factoryMovePeriod", 2))
@@ -420,30 +439,84 @@ def count_unknown_visible_cells(obs, config, col, row, vision):
     return count
 
 
-def choose_factory_target(obs, config, factory, dist):
-    """North-most reachable cell from the precomputed BFS `dist` map.
-
-    The prime directive is "get the factory as far north as possible", so we pick
-    the reachable cell with the greatest row strictly north of the factory,
-    tie-broken toward the center of our own half and then by shortest distance.
-    Returns the goal cell, or None when no cell north of the factory is reachable
-    (i.e. the factory is boxed in by known walls)."""
+def _factory_half_center(config, factory):
     width = _width(config)
     half = width // 2
     if factory["col"] < half:
-        center = max(1, half // 2)
-    else:
-        center = min(width - 2, half + half // 2)
+        return max(1, half // 2)
+    return min(width - 2, half + half // 2)
+
+
+def factory_corridor_cells(path, depth=FACTORY_CORRIDOR_DEPTH):
+    """Cells on the factory's near-term route that helpers should avoid."""
+    if not path:
+        return set()
+    return set(path[1:1 + depth])
+
+
+def score_factory_target(obs, config, factory, target, dist, parent, danger=None, occupied=None):
+    """Higher is better: north progress with penalties for slow, risky routes."""
+    danger = danger or set()
+    occupied = occupied or set()
+    start = (factory["col"], factory["row"])
+    path = _reconstruct(parent, start, target)
+    if not path:
+        return None
+
     frow = factory["row"]
-    best, best_key = None, None
+    distance = dist[target]
+    row_gain = target[1] - frow
+    center = _factory_half_center(config, factory)
+    lookahead = path[1:1 + FACTORY_ROUTE_LOOKAHEAD]
+    backtrack = sum(max(0, frow - r) for _c, r in lookahead)
+    max_dip = max([max(0, frow - r) for _c, r in lookahead] or [0])
+    unknown = sum(1 for c, r in lookahead if not is_known(obs, config, c, r))
+    danger_hits = sum(1 for cell in lookahead if cell in danger)
+    blocked_hits = sum(1 for cell in lookahead if cell in occupied and cell != start)
+    first_blocked = 1 if len(path) > 1 and path[1] in occupied else 0
+
+    return (
+        row_gain * 18
+        - distance * 3
+        - abs(target[0] - center)
+        - backtrack * 8
+        - max_dip * 6
+        - unknown * 2
+        - danger_hits * 80
+        - blocked_hits * 50
+        - first_blocked * 100
+    )
+
+
+def choose_factory_target(obs, config, factory, dist, parent, previous_goal=None,
+                          danger=None, occupied=None):
+    """Best reachable route from the precomputed BFS maps.
+
+    The factory still values north progress most, but now accounts for route
+    length, backtracking, fog confidence, danger, and near-term blockage. If the
+    previous goal remains reachable, keep it unless the replacement is clearly
+    better; this prevents path thrashing as scouts reveal new cells."""
+    frow = factory["row"]
+    best, best_score = None, None
     for cell, d in dist.items():
         c, r = cell
         if r <= frow:
             continue
-        # Maximize row, then prefer center column, then shortest path.
-        key = (-r, abs(c - center), d)
-        if best_key is None or key < best_key:
-            best, best_key = cell, key
+        score = score_factory_target(obs, config, factory, cell, dist, parent, danger, occupied)
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best, best_score = cell, score
+    if previous_goal in dist and previous_goal[1] > frow:
+        previous_score = score_factory_target(
+            obs, config, factory, previous_goal, dist, parent, danger, occupied
+        )
+        if previous_score is None:
+            return best
+        if best is not None and best != previous_goal \
+                and best_score > previous_score + FACTORY_GOAL_SWITCH_MARGIN:
+            return best
+        return previous_goal
     return best
 
 
@@ -469,7 +542,7 @@ def choose_crystal_target(obs, config, start, dist, max_dist=None):
     return best
 
 
-def choose_frontier_target(obs, config, start, vision, dist, factory=None):
+def choose_frontier_target(obs, config, start, vision, dist, factory=None, corridor=None):
     """Reachable cell that maximizes information gain.
 
     Base score = 5*unknown_in_vision + 2*row_progress - distance. When a factory
@@ -477,6 +550,7 @@ def choose_frontier_target(obs, config, start, vision, dist, factory=None):
     for cells north of the factory and a penalty for straying from its column.
     This keeps the fog cleared along the factory's intended path."""
     south = _south(obs)
+    corridor = corridor or set()
     best, best_score = None, None
     for cell, d in dist.items():
         if cell == start:
@@ -489,9 +563,64 @@ def choose_frontier_target(obs, config, start, vision, dist, factory=None):
         if factory is not None:
             score += FRONTIER_AHEAD_WEIGHT * max(0, r - factory["row"])
             score -= FRONTIER_COL_WEIGHT * abs(c - factory["col"])
+        if corridor:
+            near_corridor = min(abs(c - cc) + abs(r - rr) for cc, rr in corridor)
+            score += max(0, 4 - near_corridor) * 3
         if best_score is None or score > best_score:
             best, best_score = cell, score
     return best
+
+
+def _first_reachable_progress_distance(factory, dist):
+    """Shortest distance to any reachable cell north of the factory."""
+    frow = factory["row"]
+    best = None
+    for _cell, d in dist.items():
+        if _cell[1] <= frow:
+            continue
+        if best is None or d < best:
+            best = d
+    return best
+
+
+def project_factory_margin(obs, config, factory, distance_to_progress=None):
+    """Estimated scroll buffer after the factory reaches its next progress cell."""
+    margin = factory["row"] - _south(obs)
+    if distance_to_progress is None:
+        return margin
+    step = int(_get(obs, "step", 0))
+    interval = max(1, _scroll_interval(step, config))
+    move_period = max(1, int(_get(config, "factoryMovePeriod", 2)))
+    turns = distance_to_progress * move_period
+    scrolls = turns / interval
+    return margin + 1 - scrolls
+
+
+def build_value(kind, obs, config, factory, occupied, corridor, boxed, route_blocked):
+    """Return whether this build is worth spending reserve under current pressure."""
+    margin = factory["row"] - _south(obs)
+    if kind in ("SCOUT", "MINER") and margin <= FACTORY_LOW_MARGIN:
+        return False
+    if kind == "WORKER":
+        return boxed or route_blocked
+    if kind == "MINER":
+        nodes = _get(obs, "miningNodes", {}) or {}
+        if not nodes:
+            return False
+        start = (factory["col"], factory["row"])
+        reserved = set(occupied)
+        reserved.discard(start)
+        dist, _parent = _bfs_all(obs, config, start, reserved, max(_south(obs) + 2, factory["row"] - FACTORY_BACKTRACK_LIMIT))
+        target = choose_mining_node_target(obs, config, start, dist)
+        return target is not None and dist[target] <= 8 and (target[1] - _south(obs)) >= MINER_SAFE_MARGIN
+    if kind == "SCOUT":
+        return bool(_build_direction(obs, config, factory, occupied, corridor))
+    return False
+
+
+def _can_afford_worker_escape(factory, config):
+    worker_cost = int(_get(config, "workerCost", 200))
+    return factory["energy"] >= worker_cost + 25
 
 
 def choose_mining_node_target(obs, config, start, dist):
@@ -567,10 +696,16 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
     danger = danger or set()
     south = _south(obs)
     start = (factory["col"], factory["row"])
+    memory_key = factory["owner"]
+    if int(_get(obs, "step", 0)) <= 1:
+        _FACTORY_GOALS.pop(memory_key, None)
+        _FACTORY_CORRIDORS.pop(memory_key, None)
     # Bound how far south the factory may dip: only a small detour below its
     # current row (never march back toward the scroll), and always stay clear of
     # the boundary. This is what stops the factory backtracking into death.
-    min_row = max(south + 2, factory["row"] - FACTORY_BACKTRACK_LIMIT)
+    margin = factory["row"] - south
+    backtrack_limit = 0 if margin <= FACTORY_LOW_MARGIN else FACTORY_BACKTRACK_LIMIT
+    min_row = max(south + 2, factory["row"] - backtrack_limit)
 
     def _try_jump():
         lc, lr = factory["col"], factory["row"] + 2
@@ -581,6 +716,7 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
         if (lr - south) < 1:
             return None
         _commit(occupied, start, (lc, lr))
+        _FACTORY_CORRIDORS[memory_key] = set()
         return "JUMP_NORTH"
 
     # Optimistic BFS (fog treated as open) over reachable cells, avoiding danger.
@@ -588,13 +724,37 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
     reserved = set(occupied)
     reserved.discard(start)
     reserved |= danger
-    dist, _parent = _bfs_all(obs, config, start, reserved, min_row)
-    north_target = choose_factory_target(obs, config, factory, dist)
+    dist, parent = _bfs_all(obs, config, start, reserved, min_row)
+    north_target = choose_factory_target(
+        obs, config, factory, dist, parent, _FACTORY_GOALS.get(memory_key),
+        danger, occupied
+    )
+    if north_target is None:
+        _FACTORY_GOALS.pop(memory_key, None)
+    else:
+        _FACTORY_GOALS[memory_key] = north_target
+    corridor = set()
+    if north_target is not None:
+        planned_path = _reconstruct(parent, start, north_target)
+        if planned_path and len(planned_path) > 1:
+            corridor = factory_corridor_cells(planned_path)
     boxed = north_target is None  # no cell north of us is reachable -> walled in
+    distance_to_progress = _first_reachable_progress_distance(factory, dist)
+    route_blocked = boxed or has_wall(obs, config, factory["col"], factory["row"], "NORTH") \
+        or (distance_to_progress is not None and distance_to_progress > 4)
+
+    def _publish_corridor():
+        _FACTORY_CORRIDORS[memory_key] = set(corridor)
+        occupied.update(corridor)
 
     # 0) Lookahead jump: project whether walking out-runs the scroll; jump only
     # when it doesn't (or we're boxed), so the 20-turn jump is saved for need.
-    if _can_jump_now(factory) and _factory_should_jump(obs, config, factory, not boxed, boxed):
+    can_build_escape_worker = (
+        workers := sum(1 for r in mine_robots.values() if r["type"] == WORKER)
+    ) < 1 and _can_build_now(factory) and _can_afford_worker_escape(factory, config)
+    if _can_jump_now(factory) and _factory_should_jump(
+            obs, config, factory, not boxed, boxed, distance_to_progress) \
+            and (not boxed or margin <= FACTORY_JUMP_ROUTE_MARGIN or not can_build_escape_worker):
         j = _try_jump()
         if j:
             return j
@@ -604,32 +764,46 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
         action, new_cell = _move_action(obs, config, factory, {north_target}, occupied, min_row, danger)
         if action:
             _commit(occupied, start, new_cell)
+            _publish_corridor()
             return action
 
     # 2) Build phase: only reached on a move-cooldown turn or when boxed, so it
     # never costs us a northward step. Reserve-gated to avoid bankruptcy.
     scouts = sum(1 for r in mine_robots.values() if r["type"] == SCOUT)
-    workers = sum(1 for r in mine_robots.values() if r["type"] == WORKER)
     miners = sum(1 for r in mine_robots.values() if r["type"] == MINER)
     mining_visible = len(_get(obs, "miningNodes", {}) or {}) > 0
     energy = factory["energy"]
     scout_cost = int(_get(config, "scoutCost", 50))
-    worker_cost = int(_get(config, "workerCost", 200))
     miner_cost = int(_get(config, "minerCost", 300))
 
     if _can_build_now(factory):
-        if scouts < 2 and energy - scout_cost >= FACTORY_RESERVE:
-            d = _build_direction(obs, config, factory, occupied)
+        if route_blocked and workers < 1 and _can_afford_worker_escape(factory, config) \
+                and build_value("WORKER", obs, config, factory, occupied, corridor, boxed, route_blocked):
+            d = _build_direction(obs, config, factory, occupied, corridor)
             if d:
+                occupied.add(apply_move(factory["col"], factory["row"], d))
+                _publish_corridor()
+                return "BUILD_WORKER_" + d
+        if scouts < 2 and energy - scout_cost >= FACTORY_RESERVE \
+                and build_value("SCOUT", obs, config, factory, occupied, corridor, boxed, route_blocked):
+            d = _build_direction(obs, config, factory, occupied, corridor)
+            if d:
+                occupied.add(apply_move(factory["col"], factory["row"], d))
+                _publish_corridor()
                 return "BUILD_SCOUT_" + d
-        elif mining_visible and miners < 1 and energy - miner_cost >= FACTORY_RESERVE:
-            d = _build_direction(obs, config, factory, occupied)
+        elif mining_visible and miners < 1 and energy - miner_cost >= FACTORY_RESERVE \
+                and build_value("MINER", obs, config, factory, occupied, corridor, boxed, route_blocked):
+            d = _build_direction(obs, config, factory, occupied, corridor)
             if d:
+                occupied.add(apply_move(factory["col"], factory["row"], d))
+                _publish_corridor()
                 return "BUILD_MINER_" + d
-        elif boxed and workers < 1 and energy - worker_cost >= FACTORY_RESERVE:
-            # Last resort: a worker to chew through the wall that pens us in.
-            d = _build_direction(obs, config, factory, occupied)
+        elif boxed and workers < 1 and _can_afford_worker_escape(factory, config) \
+                and build_value("WORKER", obs, config, factory, occupied, corridor, boxed, route_blocked):
+            d = _build_direction(obs, config, factory, occupied, corridor)
             if d:
+                occupied.add(apply_move(factory["col"], factory["row"], d))
+                _publish_corridor()
                 return "BUILD_WORKER_" + d
 
     # 3) Boxed in: jump two cells north (ignores walls) if it lands safely.
@@ -637,12 +811,17 @@ def _factory_action(obs, config, factory, mine_robots, occupied, danger=None):
         j = _try_jump()
         if j:
             return j
+    _publish_corridor()
     return "IDLE"
 
 
-def _build_direction(obs, config, factory, occupied):
+def _build_direction(obs, config, factory, occupied, avoid_cells=None):
     """Choose a spawn direction whose neighbor is open, in-window, and unoccupied."""
-    for d in ["NORTH", "EAST", "WEST", "SOUTH"]:
+    avoid_cells = {cell for cell in (avoid_cells or set()) if cell is not None}
+    width = _width(config)
+    side_first = "EAST" if factory["col"] < width // 2 else "WEST"
+    side_second = "WEST" if side_first == "EAST" else "EAST"
+    for d in [side_first, side_second, "SOUTH", "NORTH"]:
         if has_wall(obs, config, factory["col"], factory["row"], d):
             continue
         nc, nr = apply_move(factory["col"], factory["row"], d)
@@ -650,12 +829,15 @@ def _build_direction(obs, config, factory, occupied):
             continue
         if (nc, nr) in occupied:
             continue
+        if (nc, nr) in avoid_cells:
+            continue
         return d
     return None
 
 
-def _scout_action(obs, config, scout, occupied, factory, danger=None):
+def _scout_action(obs, config, scout, occupied, factory, danger=None, corridor=None):
     danger = danger or set()
+    corridor = corridor or set()
     refuel = _refuel_factory_action(obs, config, scout, factory)
     if refuel:
         return refuel
@@ -673,7 +855,7 @@ def _scout_action(obs, config, scout, occupied, factory, danger=None):
     if cheap_crystal is not None:
         target = cheap_crystal
     else:
-        target = choose_frontier_target(obs, config, start, vision, dist, factory)
+        target = choose_frontier_target(obs, config, start, vision, dist, factory, corridor)
 
     if target is not None:
         action, new_cell = _move_action(obs, config, scout, {target}, occupied, min_row, danger)
@@ -731,8 +913,9 @@ def _worker_action(obs, config, worker, factory, occupied, danger=None):
     return "IDLE"
 
 
-def _miner_action(obs, config, miner, factory, occupied, danger=None):
+def _miner_action(obs, config, miner, factory, occupied, danger=None, corridor=None):
     danger = danger or set()
+    corridor = corridor or set()
     refuel = _refuel_factory_action(obs, config, miner, factory)
     if refuel:
         return refuel
@@ -761,7 +944,9 @@ def _miner_action(obs, config, miner, factory, occupied, danger=None):
             target = None
     if target is None:
         # Fall back to frontier exploration (lower priority than scouts).
-        target = choose_frontier_target(obs, config, start, int(_get(config, "visionMiner", 3)), dist)
+        target = choose_frontier_target(
+            obs, config, start, int(_get(config, "visionMiner", 3)), dist, factory, corridor
+        )
 
     if target is not None:
         action, new_cell = _move_action(obs, config, miner, {target}, occupied, min_row, danger)
@@ -788,7 +973,9 @@ def _refuel_factory_action(obs, config, robot, factory):
     game, so this income trumps whatever else the unit was going to do."""
     if factory is None:
         return None
-    if factory["energy"] >= FACTORY_REFUEL_BELOW:
+    upkeep = int(_get(config, "factoryUpkeep", 1))
+    projected_energy = factory["energy"] - FACTORY_REFUEL_LOOKAHEAD * upkeep
+    if factory["energy"] >= FACTORY_REFUEL_BELOW and projected_energy >= FACTORY_REFUEL_BELOW:
         return None
     if robot["energy"] < DONOR_MIN_ENERGY:
         return None
@@ -848,14 +1035,15 @@ def _agent_impl(obs, config):
     for robot in order:
         uid = robot["uid"]
         rtype = robot["type"]
+        corridor = _FACTORY_CORRIDORS.get(robot["owner"], set())
         if rtype == FACTORY:
             actions[uid] = _factory_action(obs, config, robot, mine, occupied, threat[FACTORY])
         elif rtype == WORKER:
             actions[uid] = _worker_action(obs, config, robot, factory, occupied, threat[WORKER])
         elif rtype == MINER:
-            actions[uid] = _miner_action(obs, config, robot, factory, occupied, threat[MINER])
+            actions[uid] = _miner_action(obs, config, robot, factory, occupied, threat[MINER], corridor)
         elif rtype == SCOUT:
-            actions[uid] = _scout_action(obs, config, robot, occupied, factory, threat[SCOUT])
+            actions[uid] = _scout_action(obs, config, robot, occupied, factory, threat[SCOUT], corridor)
         else:
             actions[uid] = "IDLE"
 
